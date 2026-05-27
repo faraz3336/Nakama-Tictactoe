@@ -4,6 +4,13 @@ import path from "node:path";
 const root = new URL(".", import.meta.url);
 const distDir = new URL("./dist/", root);
 const vendorDir = new URL("./dist/vendor/", root);
+const isVercelBuild = process.env.VERCEL === "1";
+const nakamaServerKey = process.env.NAKAMA_SERVER_KEY || "nakama-server-secret-2026-faraz";
+const nakamaUseSSL = process.env.NAKAMA_USE_SSL ?? process.env.NAKAMA_SSL ?? "true";
+
+if (isVercelBuild && !process.env.NAKAMA_SERVER_KEY) {
+  throw new Error("NAKAMA_SERVER_KEY is required for Vercel production builds.");
+}
 
 const sourceFiles = [
   "index.html",
@@ -30,9 +37,10 @@ async function main() {
   }
 
   const appConfig = `window.__APP_CONFIG__ = ${JSON.stringify({
-    nakamaHost: process.env.NAKAMA_HOST || "127.0.0.1",
-    nakamaPort: process.env.NAKAMA_PORT || "7350",
-    nakamaUseSSL: String(process.env.NAKAMA_SSL || "false").toLowerCase() === "true",
+    nakamaHost: process.env.NAKAMA_HOST || "nakama-tictactoe-khrf.onrender.com",
+    nakamaPort: process.env.NAKAMA_PORT || "443",
+    nakamaUseSSL: String(nakamaUseSSL).toLowerCase() === "true",
+    nakamaServerKey,
   }, null, 2)};\n`;
 
   await fs.writeFile(new URL("./app-config.js", distDir), appConfig, "utf8");

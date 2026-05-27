@@ -6,6 +6,13 @@ const CLIENT_MOVE_OPCODE = 1;
 const CLIENT_REMATCH_OPCODE = 2;
 const MATCHMAKER_QUERY = "";
 const DEFAULT_ROOM_NAME = "Public Room";
+const PRODUCTION_HOST = "nakama-tictactoe-khrf.onrender.com";
+const PRODUCTION_PORT = "443";
+const PRODUCTION_SERVER_KEY = "nakama-server-secret-2026-faraz";
+const RECONNECT_DELAY_MS = 1500;
+const BACKEND_WAKE_RETRIES = 12;
+const BACKEND_WAKE_RETRY_MS = 5000;
+const BACKEND_WAKE_TIMEOUT_MS = 4000;
 const STORAGE_KEYS = {
   deviceId: "nakama-ttt-device-id",
   host: "nakama-ttt-host",
@@ -26,6 +33,7 @@ const state = {
   matchmakerTicket: null,
   rooms: [],
   uiLocked: false,
+  reconnecting: false,
   connectionNonce: 0,
   lastAnnouncedMatchStateKey: "",
 };
@@ -107,7 +115,8 @@ async function login() {
     const connectionNonce = ++state.connectionNonce;
 
     const config = readSettings();
-    state.client = new NakamaJs.Client("defaultkey", config.host, config.port, config.useSSL);
+    await warmUpBackend(config);
+    state.client = new NakamaJs.Client(config.serverKey, config.host, config.port, config.useSSL);
 
     const displayName = (config.displayName || "").trim() || makeGuestName();
     const session = await state.client.authenticateDevice(getDeviceId(), true, displayName);
@@ -125,6 +134,7 @@ async function login() {
     await refreshRooms({ silent: true });
     await restoreActiveMatch();
   } catch (error) {
+    reportError("login", error);
     log(`Login failed: ${formatError(error)}`, "error");
   } finally {
     setLocked(false);
@@ -179,17 +189,12 @@ function registerSocketHandlers(socket, connectionNonce) {
     }
   };
 
-  socket.ondisconnect = () => {
+  socket.ondisconnect = async () => {
     if (!isCurrentConnection(socket, connectionNonce)) {
       return;
     }
 
-    log("Socket disconnected.", "error");
-    state.socket = null;
-    state.match = null;
-    state.serverState = null;
-    state.matchmakerTicket = null;
-    render();
+    await reconnectSocket(connectionNonce);
   };
 }
 
@@ -212,6 +217,7 @@ async function refreshRoomsInternal(options = { silent: false }) {
       log(`Loaded ${state.rooms.length} public room(s).`);
     }
   } catch (error) {
+    reportError("refreshRooms", error);
     log(`Unable to load rooms: ${formatError(error)}`, "error");
   }
 
@@ -227,7 +233,9 @@ async function createRoom() {
     await cancelMatchmakerIfNeeded();
     const roomName = elements.roomNameInput.value.trim() || DEFAULT_ROOM_NAME;
     const response = await state.client.rpc(state.session, "create_match", { roomName });
-    const payload = JSON.parse(response.payload || "{}");
+    const payload = typeof response.payload === "string"
+      ? JSON.parse(response.payload || "{}")
+      : response.payload || {};
     upsertRoom({
       matchId: payload.matchId,
       roomName: payload.roomName || roomName,
@@ -242,6 +250,7 @@ async function createRoom() {
     await joinMatch(payload.matchId);
     await refreshRooms({ silent: true });
   } catch (error) {
+    reportError("createRoom", error);
     log(`Unable to create room: ${formatError(error)}`, "error");
   }
 }
@@ -262,6 +271,7 @@ async function startAutomatch() {
     log("Searching for an opponent...");
     render();
   } catch (error) {
+    reportError("startAutomatch", error);
     log(`Unable to start matchmaking: ${formatError(error)}`, "error");
   }
 }
@@ -276,6 +286,7 @@ async function joinRoom(matchId) {
     await joinMatch(matchId);
     log("Joined room successfully.");
   } catch (error) {
+    reportError("joinRoom", error);
     log(`Unable to join room: ${formatError(error)}`, "error");
   }
 }
@@ -313,6 +324,7 @@ async function leaveMatch() {
     await state.socket.leaveMatch(state.match.match_id);
     log("Left the active match.");
   } catch (error) {
+    reportError("leaveMatch", error);
     log(`Leave match failed: ${formatError(error)}`, "error");
   } finally {
     state.match = null;
@@ -335,6 +347,7 @@ async function playMove(position) {
       JSON.stringify({ position }),
     );
   } catch (error) {
+    reportError("playMove", error);
     log(`Move failed: ${formatError(error)}`, "error");
   }
 }
@@ -352,6 +365,7 @@ async function requestRematch() {
     );
     log("Rematch requested.");
   } catch (error) {
+    reportError("requestRematch", error);
     log(`Unable to request rematch: ${formatError(error)}`, "error");
   }
 }
@@ -482,13 +496,13 @@ function renderButtons() {
   const inMatch = Boolean(state.match);
   const finished = state.serverState?.status === "finished";
 
-  elements.loginButton.textContent = connected ? "Reconnect" : "Login";
+  elements.loginButton.textContent = state.reconnecting ? "Reconnecting..." : connected ? "Reconnect" : "Login";
   elements.refreshButton.disabled = !connected;
   elements.leaveButton.disabled = !inMatch;
   elements.autoMatchButton.disabled = !connected || inMatch || Boolean(state.matchmakerTicket);
   elements.createRoomButton.disabled = !connected || inMatch;
   elements.rematchButton.disabled = !inMatch || !finished;
-  elements.loginButton.disabled = state.uiLocked;
+  elements.loginButton.disabled = state.uiLocked || state.reconnecting;
 }
 
 function handleMatchStateAnnouncement(previousStatus, currentState) {
@@ -601,6 +615,7 @@ async function disconnectCurrentSession() {
   state.match = null;
   state.serverState = null;
   state.matchmakerTicket = null;
+  state.reconnecting = false;
   state.rooms = [];
   state.lastAnnouncedMatchStateKey = "";
   hideStartBanner();
@@ -613,21 +628,33 @@ function setLocked(value) {
 }
 
 function hydrateInputs() {
-  const defaultHost = APP_CONFIG.nakamaHost
-    || (window.location.hostname && window.location.hostname !== "localhost"
-      ? window.location.hostname
-      : "127.0.0.1");
-  const defaultPort = APP_CONFIG.nakamaPort || "7350";
+  const defaultHost = APP_CONFIG.nakamaHost || PRODUCTION_HOST;
+  const defaultPort = APP_CONFIG.nakamaPort || PRODUCTION_PORT;
   const defaultSsl = typeof APP_CONFIG.nakamaUseSSL === "boolean"
     ? APP_CONFIG.nakamaUseSSL
-    : false;
+    : true;
 
   elements.displayNameInput.value = localStorage.getItem(STORAGE_KEYS.displayName) || "";
-  elements.serverHostInput.value = localStorage.getItem(STORAGE_KEYS.host) || defaultHost;
-  elements.serverPortInput.value = localStorage.getItem(STORAGE_KEYS.port) || defaultPort;
-  elements.serverSslInput.checked = localStorage.getItem(STORAGE_KEYS.ssl)
-    ? localStorage.getItem(STORAGE_KEYS.ssl) === "true"
+  const storedHost = localStorage.getItem(STORAGE_KEYS.host);
+  const storedPort = localStorage.getItem(STORAGE_KEYS.port);
+  const storedSsl = localStorage.getItem(STORAGE_KEYS.ssl);
+  const shouldUseProductionConfig = Boolean(APP_CONFIG.nakamaHost);
+
+  elements.serverHostInput.value = shouldUseProductionConfig ? defaultHost : storedHost || defaultHost;
+  elements.serverPortInput.value = shouldUseProductionConfig ? defaultPort : storedPort || defaultPort;
+  elements.serverSslInput.checked = shouldUseProductionConfig
+    ? defaultSsl
+    : storedSsl
+    ? storedSsl === "true"
     : defaultSsl;
+
+  if (shouldUseProductionConfig && (
+    storedHost !== defaultHost ||
+    storedPort !== defaultPort ||
+    storedSsl !== String(defaultSsl)
+  )) {
+    persistSettings();
+  }
 }
 
 function persistSettings() {
@@ -640,9 +667,10 @@ function persistSettings() {
 function readSettings() {
   return {
     displayName: elements.displayNameInput.value.trim(),
-    host: elements.serverHostInput.value.trim() || "127.0.0.1",
-    port: elements.serverPortInput.value.trim() || "7350",
+    host: elements.serverHostInput.value.trim() || APP_CONFIG.nakamaHost || PRODUCTION_HOST,
+    port: elements.serverPortInput.value.trim() || APP_CONFIG.nakamaPort || PRODUCTION_PORT,
     useSSL: elements.serverSslInput.checked,
+    serverKey: APP_CONFIG.nakamaServerKey || PRODUCTION_SERVER_KEY,
   };
 }
 
@@ -658,6 +686,7 @@ async function restoreActiveMatch() {
     log("Rejoined your active match.");
   } catch (error) {
     clearActiveMatchId();
+    reportError("restoreActiveMatch", error);
     log(`Could not restore previous match: ${formatError(error)}`, "error");
   }
 }
@@ -686,6 +715,99 @@ function makeGuestNameFromSession() {
 
 function formatError(error) {
   return error?.message || String(error);
+}
+
+function reportError(context, error) {
+  console.error(`[${context}]`, {
+    message: formatError(error),
+    status: error?.status,
+    code: error?.code,
+  });
+}
+
+async function warmUpBackend(config) {
+  const scheme = config.useSSL ? "https" : "http";
+  const port = config.port && !["443", "80"].includes(String(config.port))
+    ? `:${config.port}`
+    : "";
+  const url = `${scheme}://${config.host}${port}/`;
+
+  for (let attempt = 1; attempt <= BACKEND_WAKE_RETRIES; attempt += 1) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), BACKEND_WAKE_TIMEOUT_MS);
+
+    try {
+      await fetch(url, {
+        cache: "no-store",
+        mode: "no-cors",
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+      return;
+    } catch (error) {
+      clearTimeout(timeoutId);
+      if (attempt === 1) {
+        log("Backend is waking up. Please wait 30-60 seconds.");
+      }
+
+      if (attempt === BACKEND_WAKE_RETRIES) {
+        throw new Error(`Backend did not respond at ${config.host}. ${formatError(error)}`);
+      }
+
+      await delay(BACKEND_WAKE_RETRY_MS);
+    }
+  }
+}
+
+async function reconnectSocket(connectionNonce) {
+  if (state.reconnecting || !state.client || !state.session) {
+    return;
+  }
+
+  const previousMatchId = state.match?.match_id || localStorage.getItem(STORAGE_KEYS.activeMatchId);
+  state.reconnecting = true;
+  state.socket = null;
+  state.match = null;
+  state.serverState = null;
+  state.matchmakerTicket = null;
+  log("Connection lost. Reconnecting...", "error");
+  render();
+
+  await delay(RECONNECT_DELAY_MS);
+
+  if (connectionNonce !== state.connectionNonce || !state.client || !state.session) {
+    state.reconnecting = false;
+    render();
+    return;
+  }
+
+  try {
+    const config = readSettings();
+    const socket = state.client.createSocket(config.useSSL, false);
+    registerSocketHandlers(socket, connectionNonce);
+    await socket.connect(state.session, true);
+    state.socket = socket;
+    state.reconnecting = false;
+    log("Realtime connection restored.", "success");
+
+    if (previousMatchId) {
+      await joinMatch(previousMatchId);
+    }
+
+    await refreshRooms({ silent: true });
+  } catch (error) {
+    state.reconnecting = false;
+    reportError("reconnectSocket", error);
+    log(`Reconnect failed: ${formatError(error)}`, "error");
+  } finally {
+    render();
+  }
+}
+
+function delay(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 function safeParseJson(value, fallback) {
