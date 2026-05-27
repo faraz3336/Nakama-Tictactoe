@@ -1,32 +1,44 @@
 services:
-  postgres:
-    image: postgres:15
+  # Creates the dedicated Supabase schema before Nakama migrations run.
+  # Uses DIRECT_URL because schema DDL should avoid the PgBouncer pooler.
+  nakama-schema:
+    image: postgres:15-alpine
     environment:
-      POSTGRES_DB: nakama
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-    ports:
-      - "5432:5432"
+      DIRECT_URL: ${DIRECT_URL:?DIRECT_URL is required}
+      NAKAMA_DB_SCHEMA: ${NAKAMA_DB_SCHEMA:-nakama}
+    command:
+      - sh
+      - -ec
+      - |
+        : "$${DIRECT_URL:?DIRECT_URL is required}"
+        : "$${NAKAMA_DB_SCHEMA:=nakama}"
+        psql "$${DIRECT_URL}" \
+          -v ON_ERROR_STOP=1 \
+          -c "CREATE SCHEMA IF NOT EXISTS \"$${NAKAMA_DB_SCHEMA}\";"
 
   nakama:
-    image: heroiclabs/nakama:3.20.0
+    build:
+      context: .
+      dockerfile: Dockerfile
     depends_on:
-      - postgres
+      nakama-schema:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+      # Render sets PORT dynamically; local compose keeps Nakama on the
+      # standard client API port and console on the standard console port.
+      PORT: ${PORT:-7350}
+      NAKAMA_CONSOLE_PORT: ${NAKAMA_CONSOLE_PORT:-7351}
+      NAKAMA_DB_SCHEMA: ${NAKAMA_DB_SCHEMA:-nakama}
+      NAKAMA_SERVER_KEY: ${NAKAMA_SERVER_KEY:?NAKAMA_SERVER_KEY is required}
+      NAKAMA_RUNTIME_HTTP_KEY: ${NAKAMA_RUNTIME_HTTP_KEY:?NAKAMA_RUNTIME_HTTP_KEY is required}
+      NAKAMA_SESSION_ENCRYPTION_KEY: ${NAKAMA_SESSION_ENCRYPTION_KEY:?NAKAMA_SESSION_ENCRYPTION_KEY is required}
+      NAKAMA_REFRESH_ENCRYPTION_KEY: ${NAKAMA_REFRESH_ENCRYPTION_KEY:?NAKAMA_REFRESH_ENCRYPTION_KEY is required}
+      NAKAMA_CONSOLE_USERNAME: ${NAKAMA_CONSOLE_USERNAME:-admin}
+      NAKAMA_CONSOLE_PASSWORD: ${NAKAMA_CONSOLE_PASSWORD:?NAKAMA_CONSOLE_PASSWORD is required}
+      NAKAMA_CONSOLE_SIGNING_KEY: ${NAKAMA_CONSOLE_SIGNING_KEY:?NAKAMA_CONSOLE_SIGNING_KEY is required}
     volumes:
-      - ./data/modules:/nakama/data/modules
+      - ./data/modules:/nakama/data/modules:ro
     ports:
-      - "7350:7350"
-      - "7351:7351"
-    entrypoint:
-      - "/bin/sh"
-      - "-ecx"
-      - |
-        echo "Waiting for Postgres...";
-        sleep 5;
-        /nakama/nakama migrate up --database.address postgres:postgres@postgres:5432/nakama &&
-        exec /nakama/nakama \
-          --name nakama1 \
-          --database.address postgres:postgres@postgres:5432/nakama \
-          --runtime.path=/nakama/data/modules \
-          --runtime.js_entrypoint=match.js \
-          --logger.level DEBUG
+      - "${PORT:-7350}:${PORT:-7350}"
+      - "${NAKAMA_CONSOLE_PORT:-7351}:${NAKAMA_CONSOLE_PORT:-7351}"
