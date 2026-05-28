@@ -7,6 +7,16 @@
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
+    <div class="backend-overlay" id="backend-overlay" role="status" aria-live="polite">
+      <div class="backend-card">
+        <div class="backend-spinner" aria-hidden="true"></div>
+        <h2 id="backend-overlay-title">Game server is starting...</h2>
+        <p id="backend-overlay-subtext">This may take 30-60 seconds on first load.</p>
+        <p class="backend-detail" id="backend-overlay-detail">Checking game server status...</p>
+        <button id="backend-retry-button" class="primary" type="button" hidden>Retry</button>
+      </div>
+    </div>
+
     <main class="app-shell">
       <section class="hero">
         <div>

@@ -10,6 +10,8 @@ const PRODUCTION_HOST = "nakama-tictactoe-khrf.onrender.com";
 const PRODUCTION_PORT = "443";
 const PRODUCTION_SERVER_KEY = "nakama-server-secret-2026-faraz";
 const RECONNECT_DELAY_MS = 1500;
+const STARTUP_POLL_INTERVAL_MS = 5000;
+const STARTUP_TIMEOUT_MS = 90000;
 const BACKEND_WAKE_RETRIES = 12;
 const BACKEND_WAKE_RETRY_MS = 5000;
 const BACKEND_WAKE_TIMEOUT_MS = 4000;
@@ -34,6 +36,11 @@ const state = {
   rooms: [],
   uiLocked: false,
   reconnecting: false,
+  backendReady: false,
+  backendTimedOut: false,
+  backendPollTimer: null,
+  backendAbortController: null,
+  backendCheckId: 0,
   connectionNonce: 0,
   lastAnnouncedMatchStateKey: "",
 };
@@ -65,6 +72,11 @@ const elements = {
   serverPortInput: document.querySelector("#server-port"),
   serverSslInput: document.querySelector("#server-ssl"),
   roomNameInput: document.querySelector("#room-name"),
+  backendOverlay: document.querySelector("#backend-overlay"),
+  backendOverlayTitle: document.querySelector("#backend-overlay-title"),
+  backendOverlaySubtext: document.querySelector("#backend-overlay-subtext"),
+  backendOverlayDetail: document.querySelector("#backend-overlay-detail"),
+  backendRetryButton: document.querySelector("#backend-retry-button"),
 };
 
 bootstrap();
@@ -74,6 +86,7 @@ function bootstrap() {
   buildBoard();
   bindEvents();
   render();
+  startBackendStartupCheck();
 }
 
 function bindEvents() {
@@ -87,6 +100,8 @@ function bindEvents() {
   elements.serverHostInput.addEventListener("change", persistSettings);
   elements.serverPortInput.addEventListener("change", persistSettings);
   elements.serverSslInput.addEventListener("change", persistSettings);
+  elements.backendRetryButton.addEventListener("click", startBackendStartupCheck);
+  window.addEventListener("pagehide", cleanupBackendStartupCheck);
 }
 
 function buildBoard() {
@@ -115,7 +130,7 @@ async function login() {
     const connectionNonce = ++state.connectionNonce;
 
     const config = readSettings();
-    await warmUpBackend(config);
+    await waitForBackendReady(config);
     state.client = new NakamaJs.Client(config.serverKey, config.host, config.port, config.useSSL);
 
     const displayName = (config.displayName || "").trim() || makeGuestName();
@@ -495,14 +510,15 @@ function renderButtons() {
   const connected = Boolean(state.socket && state.session);
   const inMatch = Boolean(state.match);
   const finished = state.serverState?.status === "finished";
+  const backendReady = state.backendReady;
 
   elements.loginButton.textContent = state.reconnecting ? "Reconnecting..." : connected ? "Reconnect" : "Login";
-  elements.refreshButton.disabled = !connected;
+  elements.refreshButton.disabled = !connected || !backendReady;
   elements.leaveButton.disabled = !inMatch;
-  elements.autoMatchButton.disabled = !connected || inMatch || Boolean(state.matchmakerTicket);
-  elements.createRoomButton.disabled = !connected || inMatch;
+  elements.autoMatchButton.disabled = !backendReady || !connected || inMatch || Boolean(state.matchmakerTicket);
+  elements.createRoomButton.disabled = !backendReady || !connected || inMatch;
   elements.rematchButton.disabled = !inMatch || !finished;
-  elements.loginButton.disabled = state.uiLocked || state.reconnecting;
+  elements.loginButton.disabled = !backendReady || state.uiLocked || state.reconnecting;
 }
 
 function handleMatchStateAnnouncement(previousStatus, currentState) {
@@ -725,27 +741,120 @@ function reportError(context, error) {
   });
 }
 
-async function warmUpBackend(config) {
+function startBackendStartupCheck() {
+  cleanupBackendStartupCheck();
+  state.backendReady = false;
+  state.backendTimedOut = false;
+  state.backendCheckId += 1;
+  document.body.classList.add("backend-waiting");
+  renderBackendOverlay("Checking game server status...");
+  pollBackendUntilReady(Date.now(), state.backendCheckId);
+  renderButtons();
+}
+
+async function pollBackendUntilReady(startedAt, checkId) {
+  if (checkId !== state.backendCheckId) {
+    return;
+  }
+
+  const elapsed = Date.now() - startedAt;
+
+  if (elapsed >= STARTUP_TIMEOUT_MS) {
+    state.backendTimedOut = true;
+    state.backendReady = false;
+    renderBackendOverlay("Server is taking longer than expected. Please retry.");
+    renderButtons();
+    return;
+  }
+
+  try {
+    state.backendAbortController = new AbortController();
+    await probeBackend(readSettings(), state.backendAbortController.signal);
+    if (checkId !== state.backendCheckId) {
+      return;
+    }
+    state.backendReady = true;
+    state.backendTimedOut = false;
+    state.backendAbortController = null;
+    elements.backendOverlay.hidden = true;
+    document.body.classList.remove("backend-waiting");
+    renderButtons();
+  } catch (error) {
+    if (checkId !== state.backendCheckId) {
+      return;
+    }
+    reportError("backendStartupCheck", error);
+    const nextAttempt = Math.floor((elapsed + STARTUP_POLL_INTERVAL_MS) / 1000);
+    renderBackendOverlay(`Still waking up. Retrying for ${nextAttempt}s...`);
+    state.backendPollTimer = window.setTimeout(() => {
+      pollBackendUntilReady(startedAt, checkId);
+    }, STARTUP_POLL_INTERVAL_MS);
+  }
+}
+
+function cleanupBackendStartupCheck() {
+  state.backendCheckId += 1;
+  window.clearTimeout(state.backendPollTimer);
+  state.backendPollTimer = null;
+  state.backendAbortController?.abort();
+  state.backendAbortController = null;
+}
+
+function renderBackendOverlay(detail) {
+  elements.backendOverlay.hidden = false;
+  elements.backendOverlayTitle.textContent = state.backendTimedOut
+    ? "Server is taking longer than expected. Please retry."
+    : "Game server is starting...";
+  elements.backendOverlaySubtext.textContent = state.backendTimedOut
+    ? "Render may still be waking the game server."
+    : "This may take 30-60 seconds on first load.";
+  elements.backendOverlayDetail.textContent = detail;
+  elements.backendRetryButton.hidden = !state.backendTimedOut;
+}
+
+async function waitForBackendReady(config) {
+  if (state.backendReady) {
+    return;
+  }
+
+  await warmUpBackend(config);
+  state.backendReady = true;
+  elements.backendOverlay.hidden = true;
+  document.body.classList.remove("backend-waiting");
+}
+
+async function probeBackend(config, externalSignal) {
   const scheme = config.useSSL ? "https" : "http";
   const port = config.port && !["443", "80"].includes(String(config.port))
     ? `:${config.port}`
     : "";
   const url = `${scheme}://${config.host}${port}/`;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), BACKEND_WAKE_TIMEOUT_MS);
+  const abortFromExternalSignal = () => controller.abort();
 
+  if (externalSignal) {
+    externalSignal.addEventListener("abort", abortFromExternalSignal, { once: true });
+  }
+
+  try {
+    await fetch(url, {
+      cache: "no-store",
+      mode: "no-cors",
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeoutId);
+    externalSignal?.removeEventListener("abort", abortFromExternalSignal);
+  }
+}
+
+async function warmUpBackend(config) {
   for (let attempt = 1; attempt <= BACKEND_WAKE_RETRIES; attempt += 1) {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), BACKEND_WAKE_TIMEOUT_MS);
-
     try {
-      await fetch(url, {
-        cache: "no-store",
-        mode: "no-cors",
-        signal: controller.signal,
-      });
-      clearTimeout(timeoutId);
+      await probeBackend(config);
       return;
     } catch (error) {
-      clearTimeout(timeoutId);
       if (attempt === 1) {
         log("Backend is waking up. Please wait 30-60 seconds.");
       }
